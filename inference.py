@@ -75,6 +75,10 @@ def init_pipeline(model_path=MODEL_PATH, device="cuda", low_vram=False):
     print(f"[Pipeline] Loading from {model_path}...")
     pipeline = Pixal3DImageTo3DPipeline.from_pretrained(model_path)
 
+    print("[Rembg] Replacing rembg model with SAM3 (text prompt='plant')...")
+    from pixal3d.pipelines.rembg import SAM3Rembg
+    pipeline.rembg_model = SAM3Rembg(prompt="plant")
+
     print("[ImageCond] Building DinoV3ProjFeatureExtractor models...")
     pipeline.image_cond_model_ss = build_image_cond_model(IMAGE_COND_CONFIGS["ss"])
     pipeline.image_cond_model_shape_512 = build_image_cond_model(IMAGE_COND_CONFIGS["shape_512"])
