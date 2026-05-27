@@ -192,9 +192,17 @@ def run_inference(
     img = Image.open(image_path)
     image_preprocessed = pipeline.preprocess_image(img)
 
-    # Save preprocessed image for MoGe
-    tmp_path = os.path.join(os.path.dirname(os.path.abspath(output_path)), f"_tmp_preprocessed_{int(time.time()*1000)}.png")
-    image_preprocessed.save(tmp_path)
+    # Persist the background-removed / cropped image alongside the GLB output
+    # so users can inspect what the pipeline actually sees.
+    out_dir = os.path.dirname(os.path.abspath(output_path))
+    os.makedirs(out_dir, exist_ok=True)
+    base_name = os.path.splitext(os.path.basename(output_path))[0]
+    preprocessed_path = os.path.join(out_dir, f"{base_name}_preprocessed.png")
+    image_preprocessed.save(preprocessed_path)
+    print(f"[Inference] Preprocessed image saved to: {preprocessed_path}")
+
+    # Save preprocessed image for MoGe (uses the same persisted file).
+    tmp_path = preprocessed_path
 
     # Camera estimation
     if manual_fov > 0:
@@ -222,7 +230,6 @@ def run_inference(
         moge_model.cpu()
         del moge_model
         torch.cuda.empty_cache()
-    os.remove(tmp_path)
 
     # Run pipeline
     print("[Inference] Running 3D generation pipeline...")
