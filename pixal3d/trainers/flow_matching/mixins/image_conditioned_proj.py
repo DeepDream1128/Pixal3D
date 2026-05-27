@@ -184,51 +184,61 @@ class ProjGrid(nn.Module):
         distance: torch.Tensor,
         mesh_scale: torch.Tensor,
         transform_matrix: Optional[torch.Tensor] = None,
-        BHWC: bool = True
-    ) -> torch.Tensor:
+        BHWC: bool = True,
+        return_valid: bool = False,
+    ):
         """
         Project 3D grid points to image and sample features.
-        
+
         Args:
-            features_map: Feature map, shape [B, H, W, C] if BHWC else [B, C, H, W]
-            camera_angle_x: Camera FOV angle, shape [B]
-            distance: Camera distance, shape [B]
-            mesh_scale: Mesh scale factor, shape [B]
-            transform_matrix: Optional camera transform matrix, shape [B, 4, 4]
-            BHWC: Whether features_map is in BHWC format
-            
+            features_map: Feature map, [B, H, W, C] if BHWC else [B, C, H, W]
+            camera_angle_x: Camera FOV angle, [B]
+            distance: Camera distance, [B]
+            mesh_scale: Mesh scale factor, [B]
+            transform_matrix: Optional camera transform matrix [B, 4, 4]
+                (None falls back to ``front_view_transform_matrix`` + distance,
+                which is what the released checkpoints were trained on).
+            BHWC: Whether features_map is in BHWC format.
+            return_valid: If True, also return the per-point valid mask
+                (whether the projected pixel falls inside the image and is
+                in front of the camera).
+
         Returns:
-            Projected features, shape [B, grid_resolution³, C]
+            ``x`` of shape [B, grid_resolution³, C], or ``(x, valid_mask)``
+            if ``return_valid``, where ``valid_mask`` is [B, grid_resolution³].
         """
         if BHWC:
             B, H, W, C = features_map.shape
         else:
             B, C, H, W = features_map.shape
-            
+
         grid_points = self.grid_points
         grid_points = grid_points.expand(B, -1, -1)
-        grid_points = grid_points / mesh_scale.unsqueeze(-1).unsqueeze(-1) / 2  # Scale alignment
-        assert transform_matrix is None, "transform_matrix is not None"
+        grid_points = grid_points / mesh_scale.unsqueeze(-1).unsqueeze(-1) / 2
+
         if transform_matrix is None:
             transform_matrix = self.front_view_transform_matrix
             transform_matrix = transform_matrix.expand(B, -1, -1).clone()
-            transform_matrix[:, 1, 3] = -distance  # Set camera distance
-            
-        # Project to image coordinates (simulate Blender projection)
+            transform_matrix[:, 1, 3] = -distance
+        else:
+            if transform_matrix.dim() == 2:
+                transform_matrix = transform_matrix.unsqueeze(0).expand(B, -1, -1)
+            transform_matrix = transform_matrix.to(grid_points.device, grid_points.dtype)
+
         image_points, depth, valid_mask = project_points_to_image_batch(
             grid_points, transform_matrix, camera_angle_x, self.image_resolution
         )
-        
-        # Normalize to [-1, 1] for grid_sample
+
         image_points_norm = (image_points + 0.5) / self.image_resolution * 2 - 1
-        
+
         if BHWC:
-            features_map = features_map.permute(0, 3, 1, 2)  # [B, C, H, W]
-            
-        # Sample features from DINOv3 patch feature map
-        x = sample_features(features_map, image_points_norm)  # [B, C, K]
-        x = x.permute(0, 2, 1)  # [B, K, C]
-   
+            features_map = features_map.permute(0, 3, 1, 2)
+
+        x = sample_features(features_map, image_points_norm)
+        x = x.permute(0, 2, 1)
+
+        if return_valid:
+            return x, valid_mask
         return x
     
     def visualize_projection(
@@ -468,21 +478,26 @@ class DinoV3ProjFeatureExtractor(nn.Module):
         distance: Optional[torch.Tensor] = None,
         mesh_scale: Optional[torch.Tensor] = None,
         transform_matrix: Optional[torch.Tensor] = None,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        return_valid: bool = False,
+    ):
         """
         Extract view-aligned features from the image.
-        
+
         Args:
             image: Input image tensor [B, C, H, W] or list of PIL images
             camera_angle_x: Camera FOV angle in radians [B]
             distance: Camera distance [B]
             mesh_scale: Mesh scale factor [B]
             transform_matrix: Optional camera transform matrix [B, 4, 4]
-        
+            return_valid: If True, also return per-grid-point valid mask
+                shape [B, grid_resolution³] (whether the projected pixel is
+                inside the image and in front of the camera).
+
         Returns:
-            Tuple of (global_features, proj_features):
+            (global_features, proj_features) or
+            (global_features, proj_features, valid_mask) if ``return_valid``.
             - global_features: [B, num_global_tokens, embed_dim]
-            - proj_features: [B, grid_resolution³, proj_channels]
+            - proj_features:   [B, grid_resolution³, proj_channels]
               where proj_channels = embed_dim (no NAF) or embed_dim*2 (with NAF)
         """
         # Handle input types
@@ -525,44 +540,43 @@ class DinoV3ProjFeatureExtractor(nn.Module):
                 raise ValueError("camera_angle_x, distance, and mesh_scale must be provided")
             
             # --- Low-resolution branch: sample from DINOv3 patch feature map ---
-            z_proj_lr = self.proj_grid(
-                z_patchtokens_spatial, 
-                camera_angle_x, 
-                distance, 
+            lr_out = self.proj_grid(
+                z_patchtokens_spatial,
+                camera_angle_x,
+                distance,
                 mesh_scale,
-                transform_matrix
-            )  # [B, grid_res³, D]
-            
+                transform_matrix,
+                return_valid=return_valid,
+            )
+            if return_valid:
+                z_proj_lr, valid_mask = lr_out
+            else:
+                z_proj_lr = lr_out
+                valid_mask = None
+
             # --- High-resolution branch (NAF): upsample then sample ---
             if self.use_naf_upsample:
                 self._load_naf()
-                # NAF expects: guide [B, 3, H, W], lr_features [B, C, h, w], target_size (H', W')
-                lr_features_bchw = z_patchtokens_spatial.permute(0, 3, 1, 2)  # [B, D, h, w]
+                lr_features_bchw = z_patchtokens_spatial.permute(0, 3, 1, 2)
                 hr_features = self.naf_model(
                     image_for_naf, lr_features_bchw, self.naf_target_size
-                )  # [B, D, H', W']
-                
-                # Sample from high-res feature map using same projection coordinates
+                )
                 z_proj_hr = self.proj_grid(
                     hr_features,
                     camera_angle_x,
                     distance,
                     mesh_scale,
                     transform_matrix,
-                    BHWC=False  # hr_features is [B, C, H', W']
-                )  # [B, grid_res³, D]
-                
-                # Concatenate lr and hr: [B, grid_res³, D*2]
+                    BHWC=False,
+                )
                 z_proj = torch.cat([z_proj_lr, z_proj_hr], dim=-1)
             else:
-                z_proj = z_proj_lr  # [B, grid_res³, D]
-                
-            # Combine global tokens
-            z_global = torch.cat([z_clstoken, z_regtokens], dim=1)  # [B, 1+num_reg, D]
-        
-        # proj_linear has been moved to per-block ProjectAttention
-        # z_proj stays in proj_channels, each block will project independently
-        
+                z_proj = z_proj_lr
+
+            z_global = torch.cat([z_clstoken, z_regtokens], dim=1)
+
+        if return_valid:
+            return z_global, z_proj, valid_mask
         return z_global, z_proj
     
     @torch.no_grad()

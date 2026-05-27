@@ -295,6 +295,164 @@ class Pixal3DImageTo3DPipeline(Pipeline):
         }
 
     # =========================================================================
+    # Multi-view proj conditioning (inference-time aggregation)
+    # =========================================================================
+
+    @torch.no_grad()
+    def _multiview_call(
+        self,
+        image_cond_model: nn.Module,
+        images: list,
+        camera_angle_x_list,
+        distance_list,
+        mesh_scale_list,
+        transform_matrix_list,
+    ):
+        """
+        Run image_cond_model V times (one per view) and return stacked
+        (z_global_list, z_proj_list, valid_mask_list).
+
+        Each call uses B=1 (single image) so DINOv3 patch grids stay aligned.
+        """
+        device = self.device
+        z_global_list, z_proj_list, valid_list = [], [], []
+        for img, fov, dist, ms, T in zip(
+            images, camera_angle_x_list, distance_list, mesh_scale_list, transform_matrix_list,
+        ):
+            cam_angle = torch.tensor([float(fov)], device=device)
+            dist_t = torch.tensor([float(dist)], device=device)
+            scale_t = torch.tensor([float(ms)], device=device)
+            T_t = torch.tensor(T, dtype=torch.float32, device=device).unsqueeze(0) if T is not None else None
+            zg, zp, vm = image_cond_model(
+                [img], camera_angle_x=cam_angle, distance=dist_t, mesh_scale=scale_t,
+                transform_matrix=T_t, return_valid=True,
+            )
+            z_global_list.append(zg)        # [1, M, D]
+            z_proj_list.append(zp)          # [1, R^3, C]
+            valid_list.append(vm.float())   # [1, R^3]
+        return z_global_list, z_proj_list, valid_list
+
+    @staticmethod
+    def _aggregate_proj(z_proj_list, valid_list, fallback_eps: float = 1e-6):
+        """Valid-mask weighted mean over views.
+
+        Voxels invisible in all views (sum_w == 0) fall back to plain mean
+        so they don't become zero (which would also be a valid signal but
+        differs from training distribution).
+        """
+        zp = torch.stack(z_proj_list, dim=0)             # [V, 1, R^3, C]
+        w = torch.stack(valid_list, dim=0).unsqueeze(-1) # [V, 1, R^3, 1]
+        w_sum = w.sum(dim=0)                             # [1, R^3, 1]
+        any_visible = (w_sum > 0).float()
+        norm_w = w / w_sum.clamp_min(fallback_eps)
+        weighted = (zp * norm_w).sum(dim=0)              # [1, R^3, C]
+        mean_all = zp.mean(dim=0)                        # [1, R^3, C]
+        return any_visible * weighted + (1.0 - any_visible) * mean_all
+
+    @torch.no_grad()
+    def get_proj_cond_ss_multiview(
+        self,
+        images: list,
+        camera_angle_x_list,
+        distance_list,
+        mesh_scale_list,
+        transform_matrix_list,
+        global_strategy: str = "primary",
+    ) -> dict:
+        """Multi-view version of get_proj_cond_ss.
+
+        Args:
+            images: List of V PIL images.
+            camera_angle_x_list / distance_list / mesh_scale_list: each length V.
+            transform_matrix_list: List of V 4x4 numpy arrays (world->camera in
+                Blender convention) or None to use front-view default.
+            global_strategy: "primary" (use view 0's z_global) or "mean".
+        """
+        image_cond_model = self.image_cond_model_ss
+        device = self.device
+        if self.low_vram:
+            image_cond_model.to(device)
+
+        zg_list, zp_list, vm_list = self._multiview_call(
+            image_cond_model, images,
+            camera_angle_x_list, distance_list, mesh_scale_list, transform_matrix_list,
+        )
+        if global_strategy == "primary":
+            z_global = zg_list[0]
+        elif global_strategy == "mean":
+            z_global = torch.stack(zg_list, dim=0).mean(dim=0)
+        else:
+            raise ValueError(f"Unknown global_strategy={global_strategy}")
+        z_proj = self._aggregate_proj(zp_list, vm_list)
+
+        if self.low_vram:
+            image_cond_model.cpu()
+        return {
+            'cond': {'global': z_global, 'proj': z_proj},
+            'neg_cond': {'global': torch.zeros_like(z_global), 'proj': torch.zeros_like(z_proj)},
+        }
+
+    @torch.no_grad()
+    def get_proj_cond_shape_multiview(
+        self,
+        image_cond_model: nn.Module,
+        images: list,
+        coords: torch.Tensor,
+        camera_angle_x_list,
+        distance_list,
+        mesh_scale_list,
+        transform_matrix_list,
+        grid_resolution_override: int = None,
+        global_strategy: str = "primary",
+    ) -> dict:
+        """Multi-view version of get_proj_cond_shape (sparse-token aligned)."""
+        device = self.device
+        if self.low_vram:
+            image_cond_model.to(device)
+
+        orig_grid_res = image_cond_model.grid_resolution
+        if grid_resolution_override is not None and grid_resolution_override != orig_grid_res:
+            image_cond_model.grid_resolution = grid_resolution_override
+            image_cond_model.proj_grid = image_cond_model.proj_grid.__class__(
+                grid_resolution=grid_resolution_override,
+                image_resolution=image_cond_model.proj_grid.image_resolution,
+            ).to(device)
+
+        zg_list, zp_list, vm_list = self._multiview_call(
+            image_cond_model, images,
+            camera_angle_x_list, distance_list, mesh_scale_list, transform_matrix_list,
+        )
+        if global_strategy == "primary":
+            z_global = zg_list[0]
+        elif global_strategy == "mean":
+            z_global = torch.stack(zg_list, dim=0).mean(dim=0)
+        else:
+            raise ValueError(f"Unknown global_strategy={global_strategy}")
+        z_proj_dense = self._aggregate_proj(zp_list, vm_list)  # [1, R^3, C]
+
+        grid_res = image_cond_model.grid_resolution
+        z_proj_grid = z_proj_dense.reshape(1, grid_res, grid_res, grid_res, -1)
+        b_idx = coords[:, 0].long()
+        x = coords[:, 1].long(); y = coords[:, 2].long(); z = coords[:, 3].long()
+        z_proj_sparse = z_proj_grid[b_idx, x, y, z]
+        z_proj_st = SparseTensor(feats=z_proj_sparse, coords=coords)
+
+        if grid_resolution_override is not None and grid_resolution_override != orig_grid_res:
+            image_cond_model.grid_resolution = orig_grid_res
+            image_cond_model.proj_grid = image_cond_model.proj_grid.__class__(
+                grid_resolution=orig_grid_res,
+                image_resolution=image_cond_model.proj_grid.image_resolution,
+            ).to(device)
+
+        if self.low_vram:
+            image_cond_model.cpu()
+        return {
+            'cond': {'global': z_global, 'proj': z_proj_st},
+            'neg_cond': {'global': torch.zeros_like(z_global),
+                         'proj': SparseTensor(feats=torch.zeros_like(z_proj_sparse), coords=coords)},
+        }
+
+    # =========================================================================
     # Sampling methods (consistent with Trellis2)
     # =========================================================================
 
@@ -781,3 +939,145 @@ class Pixal3DImageTo3DPipeline(Pipeline):
             return out_mesh, (shape_slat, tex_slat, res)
         else:
             return out_mesh
+
+    @torch.no_grad()
+    def run_multiview(
+        self,
+        images: list,
+        camera_params_list: list,
+        num_samples: int = 1,
+        seed: int = 42,
+        sparse_structure_sampler_params: dict = {},
+        shape_slat_sampler_params: dict = {},
+        tex_slat_sampler_params: dict = {},
+        preprocess_image: bool = True,
+        return_latent: bool = False,
+        pipeline_type: Optional[str] = None,
+        max_num_tokens: int = 49152,
+        global_strategy: str = "primary",
+    ):
+        """Multi-view variant of ``run``: aggregate ``z_proj`` across V views.
+
+        Args:
+            images: List of V PIL images (already aligned with camera_params).
+            camera_params_list: List of V dicts, each with keys
+                ``camera_angle_x`` (float), ``distance`` (float),
+                ``mesh_scale`` (float, optional default 1.0),
+                ``transform_matrix`` (4x4 list/np.ndarray, optional;
+                ``None`` falls back to the front-view default).
+            preprocess_image: If True, run ``preprocess_image`` on every input.
+            global_strategy: How to fuse z_global across views — "primary"
+                (use view 0) or "mean".
+            (other args same as ``run``)
+        """
+        pipeline_type = pipeline_type or self.default_pipeline_type
+        if pipeline_type == '1024_cascade':
+            hr_resolution = 1024
+        elif pipeline_type == '1536_cascade':
+            hr_resolution = 1536
+        else:
+            raise ValueError(f"Invalid pipeline_type {pipeline_type}")
+
+        assert self.image_cond_model_ss is not None
+        assert self.image_cond_model_shape_512 is not None
+        assert self.image_cond_model_shape_1024 is not None
+        assert self.image_cond_model_tex_1024 is not None
+        assert len(images) == len(camera_params_list) and len(images) >= 1
+
+        if preprocess_image:
+            images = [self.preprocess_image(im) for im in images]
+
+        fov_list = [float(cp['camera_angle_x']) for cp in camera_params_list]
+        dist_list = [float(cp['distance']) for cp in camera_params_list]
+        ms_list = [float(cp.get('mesh_scale', 1.0)) for cp in camera_params_list]
+        T_list = [cp.get('transform_matrix', None) for cp in camera_params_list]
+
+        torch.manual_seed(seed)
+
+        # Stage 1: SS
+        cond_ss = self.get_proj_cond_ss_multiview(
+            images, fov_list, dist_list, ms_list, T_list, global_strategy=global_strategy,
+        )
+        ss_res = 32
+        coords = self.sample_sparse_structure(
+            cond_ss, ss_res, num_samples, sparse_structure_sampler_params,
+        )
+        del cond_ss; torch.cuda.empty_cache()
+
+        # Stage 2: Shape LR 512
+        cond_shape_lr = self.get_proj_cond_shape_multiview(
+            self.image_cond_model_shape_512, images, coords,
+            fov_list, dist_list, ms_list, T_list, global_strategy=global_strategy,
+        )
+        lr_slat = self.sample_shape_slat(
+            cond_shape_lr, self.models['shape_slat_flow_model_512'], coords, shape_slat_sampler_params,
+        )
+        del cond_shape_lr; torch.cuda.empty_cache()
+
+        # Stage 3a: Upsample LR -> HR coords
+        if self.low_vram:
+            self.models['shape_slat_decoder'].to(self.device)
+            self.models['shape_slat_decoder'].low_vram = True
+        hr_coords = self.models['shape_slat_decoder'].upsample(lr_slat, upsample_times=4)
+        if self.low_vram:
+            self.models['shape_slat_decoder'].cpu()
+            self.models['shape_slat_decoder'].low_vram = False
+
+        lr_resolution = 512
+        actual_hr_resolution = hr_resolution
+        while True:
+            grid_res = actual_hr_resolution // 16
+            quant_coords = torch.cat([
+                hr_coords[:, :1],
+                ((hr_coords[:, 1:] + 0.5) / lr_resolution * (grid_res - 1)).round().int(),
+            ], dim=1)
+            hr_coords_unique = quant_coords.unique(dim=0)
+            if hr_coords_unique.shape[0] < max_num_tokens or actual_hr_resolution == 1024:
+                break
+            actual_hr_resolution -= 128
+        actual_grid_res = actual_hr_resolution // 16
+        del lr_slat, hr_coords, quant_coords; torch.cuda.empty_cache()
+
+        # Stage 3b: Shape HR
+        cond_shape_hr = self.get_proj_cond_shape_multiview(
+            self.image_cond_model_shape_1024, images, hr_coords_unique,
+            fov_list, dist_list, ms_list, T_list,
+            grid_resolution_override=actual_grid_res, global_strategy=global_strategy,
+        )
+        noise_hr = SparseTensor(
+            feats=torch.randn(hr_coords_unique.shape[0], self.models['shape_slat_flow_model_1024'].in_channels).to(self.device),
+            coords=hr_coords_unique,
+        )
+        sampler_params_hr = {**self.shape_slat_sampler_params, **shape_slat_sampler_params}
+        flow_model_hr = self.models['shape_slat_flow_model_1024']
+        if self.low_vram:
+            flow_model_hr.to(self.device)
+        hr_slat = self.shape_slat_sampler.sample(
+            flow_model_hr, noise_hr, **cond_shape_hr, **sampler_params_hr,
+            verbose=True, tqdm_desc=f"Sampling HR shape SLat (mv-proj, {actual_hr_resolution})",
+        ).samples
+        if self.low_vram:
+            flow_model_hr.cpu()
+        std = torch.tensor(self.shape_slat_normalization['std'])[None].to(hr_slat.device)
+        mean = torch.tensor(self.shape_slat_normalization['mean'])[None].to(hr_slat.device)
+        shape_slat = hr_slat * std + mean
+        del cond_shape_hr, noise_hr, hr_slat, hr_coords_unique; torch.cuda.empty_cache()
+
+        # Stage 4: Texture
+        tex_grid_res = actual_hr_resolution // 16
+        cond_tex = self.get_proj_cond_shape_multiview(
+            self.image_cond_model_tex_1024, images, shape_slat.coords,
+            fov_list, dist_list, ms_list, T_list,
+            grid_resolution_override=tex_grid_res, global_strategy=global_strategy,
+        )
+        tex_slat = self.sample_tex_slat(
+            cond_tex, self.models['tex_slat_flow_model_1024'], shape_slat, tex_slat_sampler_params,
+        )
+        del cond_tex; torch.cuda.empty_cache()
+
+        # Stage 5: Decode
+        res = actual_hr_resolution
+        out_mesh = self.decode_latent(shape_slat, tex_slat, res)
+        if return_latent:
+            return out_mesh, (shape_slat, tex_slat, res)
+        return out_mesh
