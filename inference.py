@@ -184,6 +184,7 @@ def run_inference(
     max_num_tokens: int = 49152,
     model_path: str = MODEL_PATH,
     manual_fov: float = -1.0,
+    manual_distance: float = -1.0,
     low_vram: bool = False,
     resolution: int = -1,
 ):
@@ -210,16 +211,21 @@ def run_inference(
 
     # Camera estimation
     if manual_fov > 0:
-        # Use manually specified FOV (in radians)
         camera_angle_x = float(manual_fov)
-        grid_point = torch.tensor([-1.0, 0.0, 0.0])
-        distance = distance_from_fov(
-            camera_angle_x, grid_point,
-            torch.tensor([0 - extend_pixel, image_resolution - 1 + extend_pixel]),
-            mesh_scale, image_resolution
-        )["distance_from_x"]
+        if manual_distance > 0:
+            distance = float(manual_distance)
+            print(f"[Inference] Using manual FOV: {math.degrees(manual_fov):.2f}° ({manual_fov:.4f} rad), "
+                  f"manual distance={distance:.4f}, mesh_scale={mesh_scale}")
+        else:
+            grid_point = torch.tensor([-1.0, 0.0, 0.0])
+            distance = distance_from_fov(
+                camera_angle_x, grid_point,
+                torch.tensor([0 - extend_pixel, image_resolution - 1 + extend_pixel]),
+                mesh_scale, image_resolution
+            )["distance_from_x"]
+            print(f"[Inference] Using manual FOV: {math.degrees(manual_fov):.2f}° ({manual_fov:.4f} rad), "
+                  f"derived distance={distance:.4f}")
         camera_params = {'camera_angle_x': camera_angle_x, 'distance': distance, 'mesh_scale': mesh_scale}
-        print(f"[Inference] Using manual FOV: {math.degrees(manual_fov):.2f}° ({manual_fov:.4f} rad), distance={distance:.4f}")
     else:
         print("[MoGe-2] Loading model for camera estimation...")
         moge_model = load_moge_model(device="cuda")
@@ -303,6 +309,11 @@ if __name__ == "__main__":
                         help="Manual camera FOV in radians (e.g. 0.2). "
                              "If not set, FOV is auto-estimated via MoGe-2. "
                              "Try 0.2 rad if you notice distortion.")
+    parser.add_argument("--distance", type=float, default=-1.0,
+                        help="Manual camera distance (overrides distance_from_fov). "
+                             "Only honored when --fov is also set.")
+    parser.add_argument("--mesh_scale", type=float, default=1.0,
+                        help="Mesh scale factor (default 1.0).")
     parser.add_argument("--model_path", type=str, default=MODEL_PATH, help="Model path or HuggingFace repo")
     parser.add_argument("--low_vram", action="store_true",
                         help="Enable low-VRAM mode: models stay on CPU and are loaded to GPU on-demand per stage. "
@@ -317,6 +328,8 @@ if __name__ == "__main__":
         output_path=args.output,
         seed=args.seed,
         manual_fov=args.fov,
+        manual_distance=args.distance,
+        mesh_scale=args.mesh_scale,
         model_path=args.model_path,
         low_vram=args.low_vram,
         resolution=args.resolution,
