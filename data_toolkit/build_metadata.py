@@ -53,18 +53,27 @@ def build_downloaded_metadata_from_files(raw_root, global_metadata):
     Walks through raw_root to find downloaded 3D files (.glb, .obj, .fbx, .usdz, .gltf, .zip),
     matches them against global_metadata via file_identifier (uid extracted from URL) to recover
     the sha256 -> local_path mapping.
+
+    Two-pass strategy:
+      Pass 1: filename uid match (works for sketchfab/github/abo where filename == uid).
+      Pass 2 (fallback for Toys4k-style layouts): try the path implied by
+              file_identifier directly (e.g. "hammer/hammer_075/hammer_075.blend"
+              -> "<raw>/toys4k_obj_files/hammer/hammer_075/mesh.obj").
     """
     extensions = ('.glb', '.obj', '.fbx', '.usdz', '.gltf', '.zip')
     
-    # Build uid -> sha256 mapping from global metadata
+    # Pass 1: uid (basename without ext) match
     uid_to_sha256 = {}
+    fid_to_sha256 = {}
     if 'file_identifier' in global_metadata.columns:
         for _, row in global_metadata.iterrows():
-            uid = str(row['file_identifier']).split('/')[-1]
+            fid = str(row['file_identifier'])
+            uid = fid.split('/')[-1]
             uid_to_sha256[uid] = row['sha256']
-    
-    # Scan files
+            fid_to_sha256[fid] = row['sha256']
+
     records = []
+    matched_sha = set()
     for dirpath, dirnames, filenames in os.walk(raw_root):
         for fname in filenames:
             if not fname.lower().endswith(extensions):
@@ -73,10 +82,32 @@ def build_downloaded_metadata_from_files(raw_root, global_metadata):
             sha256 = uid_to_sha256.get(uid)
             if sha256 is not None:
                 full_path = os.path.join(dirpath, fname)
-                # Store path relative to parent of raw_root (i.e. download_root)
                 rel_path = os.path.relpath(full_path, os.path.dirname(raw_root))
                 records.append({'sha256': sha256, 'local_path': rel_path})
-    
+                matched_sha.add(sha256)
+
+    # Pass 2: file_identifier directory match (Toys4k mesh.obj convention)
+    pass2_count = 0
+    for fid, sha256 in fid_to_sha256.items():
+        if sha256 in matched_sha:
+            continue
+        rel_dir = os.path.dirname(fid)
+        if not rel_dir:
+            continue
+        for sub in os.listdir(raw_root) if os.path.isdir(raw_root) else []:
+            sub_dir = os.path.join(raw_root, sub)
+            if not os.path.isdir(sub_dir):
+                continue
+            cand = os.path.join(sub_dir, rel_dir, 'mesh.obj')
+            if os.path.exists(cand):
+                rel_path = os.path.relpath(cand, os.path.dirname(raw_root))
+                records.append({'sha256': sha256, 'local_path': rel_path})
+                matched_sha.add(sha256)
+                pass2_count += 1
+                break
+    if pass2_count > 0:
+        print(f'  [from_file] Pass 2 (Toys4k-style mesh.obj) matched {pass2_count} extra files')
+
     if len(records) == 0:
         return None
     

@@ -579,6 +579,77 @@ class DinoV3ProjFeatureExtractor(nn.Module):
             return z_global, z_proj, valid_mask
         return z_global, z_proj
     
+    def forward_multiview(
+        self,
+        images: torch.Tensor,
+        camera_angle_x: torch.Tensor,
+        distance: torch.Tensor,
+        mesh_scale: torch.Tensor,
+        transform_matrix: torch.Tensor,
+        view_valid: torch.Tensor,
+        primary_only_global: bool = True,
+    ):
+        """Multi-view forward: V independent calls + valid-mask weighted aggregation.
+
+        Mirrors :meth:`Pixal3DImageTo3DPipeline.run_multiview` aggregation but
+        runs in training mode (gradients allowed downstream of proj_linear).
+        DINOv3 is frozen so its forward is still no-grad inside ``forward``.
+
+        Args:
+            images: [B, V, 3, H, W] (V == max_views with padding)
+            camera_angle_x: [B, V] FOV per view (radians)
+            distance: [B, V] camera distance per view
+            mesh_scale: [B, V] mesh_scale per view (constant across views in practice)
+            transform_matrix: [B, V, 4, 4]; slot 0 is the primary canonical
+                              (treated as ``front_view`` ⇒ passed as None internally),
+                              slots 1..V-1 are aux poses in primary canonical frame
+            view_valid: [B, V] boolean, True for real views, False for padding
+            primary_only_global: If True, return primary's z_global (slot 0) instead
+                                 of averaging.
+
+        Returns:
+            (z_global, z_proj):
+              z_global: [B, num_global_tokens, embed_dim]
+              z_proj:   [B, R^3, proj_channels]
+        """
+        assert images.dim() == 5, f'expect [B, V, 3, H, W], got {images.shape}'
+        B, V = images.shape[:2]
+
+        zg_list, zp_list, vm_list = [], [], []
+        for v in range(V):
+            T_v = transform_matrix[:, v]
+            T_arg = None if v == 0 else T_v
+            zg_v, zp_v, vmask_v = self.forward(
+                images[:, v],
+                camera_angle_x=camera_angle_x[:, v],
+                distance=distance[:, v],
+                mesh_scale=mesh_scale[:, v],
+                transform_matrix=T_arg,
+                return_valid=True,
+            )
+            zg_list.append(zg_v)
+            zp_list.append(zp_v)
+            view_mask = view_valid[:, v].to(dtype=vmask_v.dtype, device=vmask_v.device)
+            vm_list.append(vmask_v.to(zp_v.dtype) * view_mask.unsqueeze(-1))
+
+        zp_stack = torch.stack(zp_list, dim=0)
+        w_stack = torch.stack(vm_list, dim=0).unsqueeze(-1)
+        w_sum = w_stack.sum(dim=0)
+        any_visible = (w_sum > 0).to(zp_stack.dtype)
+        norm_w = w_stack / w_sum.clamp_min(1e-6)
+        weighted = (zp_stack * norm_w).sum(dim=0)
+        view_w = view_valid.to(zp_stack.dtype).permute(1, 0).reshape(V, B, 1, 1)
+        view_w = view_w / view_w.sum(dim=0, keepdim=True).clamp_min(1e-6)
+        mean_all = (zp_stack * view_w).sum(dim=0)
+        z_proj = any_visible * weighted + (1.0 - any_visible) * mean_all
+
+        if primary_only_global:
+            z_global = zg_list[0]
+        else:
+            z_global = torch.stack(zg_list, dim=0).mean(dim=0)
+
+        return z_global, z_proj
+
     @torch.no_grad()
     def visualize_projection(
         self,
@@ -1287,6 +1358,65 @@ class ImageConditionedProjMixin:
         if self.world_size > 1:
             self.check_ddp()
 
+    def encode_image_proj_multiview(
+        self,
+        images: torch.Tensor,
+        camera_angle_x: torch.Tensor,
+        distance: torch.Tensor,
+        mesh_scale: torch.Tensor,
+        transform_matrix: torch.Tensor,
+        view_valid: torch.Tensor,
+        coords: Optional[torch.Tensor] = None,
+        primary_only_global: bool = True,
+    ) -> Tuple[Dict[str, torch.Tensor], Dict[str, torch.Tensor]]:
+        """Multi-view variant of :meth:`encode_image_proj`.
+
+        Aggregates V back-projected feature volumes via valid-mask weighted mean
+        (Pixal3D § 3.2.3 / § 3.4 multi-view fine-tune). Returns the same
+        cond/uncond dict shape as :meth:`encode_image_proj` so the rest of
+        ``get_cond`` is unchanged.
+
+        Args:
+            images: [B, V, 3, H, W]
+            camera_angle_x / distance / mesh_scale: [B, V]
+            transform_matrix: [B, V, 4, 4] (slot 0 = primary canonical, treated
+                              as None internally)
+            view_valid: [B, V] boolean mask, True = real view
+            coords: optional sparse coords for sparse-token aligned proj
+            primary_only_global: see :meth:`DinoV3ProjFeatureExtractor.forward_multiview`
+        """
+        if self.image_cond_model is None:
+            self._init_image_cond_model()
+        if not hasattr(self.image_cond_model, 'forward_multiview'):
+            raise RuntimeError(
+                f'image_cond_model={type(self.image_cond_model).__name__} does not '
+                f'support forward_multiview; multi-view fine-tune is currently '
+                f'only wired for DinoV3ProjFeatureExtractor.'
+            )
+
+        cond_global, cond_proj = self.image_cond_model.forward_multiview(
+            images=images,
+            camera_angle_x=camera_angle_x,
+            distance=distance,
+            mesh_scale=mesh_scale,
+            transform_matrix=transform_matrix,
+            view_valid=view_valid,
+            primary_only_global=primary_only_global,
+        )
+
+        if coords is not None:
+            B = cond_global.shape[0]
+            module = getattr(self, '_image_cond_module', self.image_cond_model)
+            grid_res = module.grid_resolution
+            cond_proj_grid = cond_proj.reshape(B, grid_res, grid_res, grid_res, -1)
+            b_idx = coords[:, 0].long()
+            x = coords[:, 1].long(); y = coords[:, 2].long(); z = coords[:, 3].long()
+            cond_proj = cond_proj_grid[b_idx, x, y, z]
+
+        cond = {'global': cond_global, 'proj': cond_proj}
+        uncond = {'global': torch.zeros_like(cond_global), 'proj': torch.zeros_like(cond_proj)}
+        return cond, uncond
+
     def encode_image_proj(
         self,
         image: torch.Tensor,
@@ -1380,7 +1510,11 @@ class ImageConditionedProjMixin:
         Supports two formats:
         1. 'camera_info' dict: {'camera_angle_x': ..., 'distance': ..., 'mesh_scale': ..., 'transform_matrix': ..., 'coords': ...}
         2. Flat fields: 'camera_angle_x', 'camera_distance', 'mesh_scale', 'transform_matrix', 'coords' in kwargs
-        
+
+        Multi-view batches (from MultiViewProjImageConditionedMixin) carry an
+        additional ``view_valid`` tensor [B, V] and per-view tensors of shape
+        [B, V] / [B, V, 4, 4]. This routine forwards them through unchanged.
+
         Returns:
             camera_info dict or None if not available
         """
@@ -1393,7 +1527,9 @@ class ImageConditionedProjMixin:
         mesh_scale = kwargs.pop('mesh_scale', None)
         transform_matrix = kwargs.pop('transform_matrix', None)
         coords = kwargs.pop('coords', None)
-        
+        view_valid = kwargs.pop('view_valid', None)
+        num_views = kwargs.pop('num_views', None)
+
         if camera_angle_x is not None and camera_distance is not None and mesh_scale is not None:
             return {
                 'camera_angle_x': camera_angle_x,
@@ -1401,9 +1537,21 @@ class ImageConditionedProjMixin:
                 'mesh_scale': mesh_scale,
                 'transform_matrix': transform_matrix,
                 'coords': coords,
+                'view_valid': view_valid,
+                'num_views': num_views,
             }
         
         return None
+
+    @staticmethod
+    def _is_multiview_camera_info(camera_info: dict) -> bool:
+        """A multi-view batch is identified by ``view_valid`` (boolean [B, V])."""
+        if camera_info is None:
+            return False
+        view_valid = camera_info.get('view_valid')
+        if view_valid is None:
+            return False
+        return view_valid.dim() == 2
         
     def get_cond(self, cond, **kwargs):
         """Get the conditioning data."""
@@ -1412,7 +1560,44 @@ class ImageConditionedProjMixin:
         if self.image_attn_mode in ('proj', 'gated_proj'):
             # Handle projection mode (both standard proj and gated_proj)
             camera_info = self._extract_camera_info(kwargs)
-            if camera_info is not None:
+            if self._is_multiview_camera_info(camera_info):
+                # ----- Multi-view fine-tune path (Route B) -----
+                if self.image_attn_mode == 'gated_proj':
+                    raise NotImplementedError(
+                        'Multi-view fine-tune is currently only wired for image_attn_mode="proj"'
+                    )
+                coords = camera_info.get('coords')
+                cond, neg_cond = self.encode_image_proj_multiview(
+                    images=cond,
+                    camera_angle_x=camera_info.get('camera_angle_x'),
+                    distance=camera_info.get('distance'),
+                    mesh_scale=camera_info.get('mesh_scale'),
+                    transform_matrix=camera_info.get('transform_matrix'),
+                    view_valid=camera_info.get('view_valid'),
+                    coords=coords,
+                    primary_only_global=True,
+                )
+                # CFG dropout (sparse-aware) — same as the single-view branch below
+                if coords is not None and hasattr(self, 'p_uncond') and self.p_uncond > 0:
+                    import numpy as np
+                    B = cond['global'].shape[0]
+                    mask = np.random.rand(B) < self.p_uncond
+                    global_tensor = cond['global']
+                    global_mask_shape = [B] + [1] * (global_tensor.ndim - 1)
+                    global_mask = torch.tensor(mask, device=global_tensor.device).reshape(global_mask_shape)
+                    cond['global'] = torch.where(global_mask, neg_cond['global'], cond['global'])
+                    batch_indices = coords[:, 0].long()
+                    for key in list(cond.keys()):
+                        if key.startswith('proj'):
+                            device = cond[key].device
+                            sparse_mask = torch.tensor(mask, device=device)[batch_indices].reshape(-1, 1)
+                            cond[key] = torch.where(sparse_mask, neg_cond[key], cond[key])
+                    return cond
+                else:
+                    kwargs['neg_cond'] = neg_cond
+                cond = super().get_cond(cond, **kwargs)
+                return cond
+            elif camera_info is not None:
                 coords = camera_info.get('coords')
                 cond, neg_cond = self.encode_image_proj(
                     cond,

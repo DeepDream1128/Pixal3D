@@ -7,7 +7,7 @@ import utils3d
 from PIL import Image
 from ..representations import Voxel
 from ..renderers import VoxelRenderer
-from .components import StandardDatasetBase, ImageConditionedMixin, ViewImageConditionedMixin
+from .components import StandardDatasetBase, ImageConditionedMixin, ViewImageConditionedMixin, MultiViewProjImageConditionedMixin
 from .. import models
 from ..utils.render_utils import yaw_pitch_r_fov_to_extrinsics_intrinsics
 
@@ -404,5 +404,18 @@ class ViewImageConditionedSparseStructureLatentView(ViewImageConditionedMixin, S
     corresponding view from render_cond.
     
     Uses ViewImageConditionedMixin which reads mesh_scale from view{XX}_scale.json.
+    """
+    pass
+
+
+class MultiViewProjSparseStructureLatentView(MultiViewProjImageConditionedMixin, SparseStructureLatentView):
+    """
+    Multi-view image-conditioned view-based sparse structure dataset (Route B).
+
+    Owns the same view-aligned latent as the single-view path (view 0 / primary)
+    but additionally loads ``num_views_per_sample`` ∈ [min_views, max_views]
+    auxiliary views with their relative camera poses, padded to ``max_views``.
+
+    See :class:`MultiViewProjImageConditionedMixin` for the output schema.
     """
     pass

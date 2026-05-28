@@ -9,6 +9,7 @@ __attributes = {
     'ImageConditionedSparseStructureLatent': 'sparse_structure_latent',
     'SparseStructureLatentView': 'sparse_structure_latent',
     'ViewImageConditionedSparseStructureLatentView': 'sparse_structure_latent',
+    'MultiViewProjSparseStructureLatentView': 'sparse_structure_latent',
     
     'SLat': 'structured_latent',
     'ImageConditionedSLat': 'structured_latent',
@@ -16,10 +17,12 @@ __attributes = {
     'ImageConditionedSLatShape': 'structured_latent_shape',
     'SLatShapeView': 'structured_latent_shape',
     'ViewImageConditionedSLatShapeView': 'structured_latent_shape',
+    'MultiViewProjSLatShapeView': 'structured_latent_shape',
     'SLatPbr': 'structured_latent_svpbr',
     'ImageConditionedSLatPbr': 'structured_latent_svpbr',
     'SLatPbrView': 'structured_latent_svpbr',
     'ViewImageConditionedSLatPbrView': 'structured_latent_svpbr',
+    'MultiViewProjSLatPbrView': 'structured_latent_svpbr',
 }
 
 __submodules = []

@@ -7,7 +7,7 @@ import torch
 import cv2
 import utils3d
 from .. import models
-from .components import StandardDatasetBase, ImageConditionedMixin, ViewImageConditionedMixin
+from .components import StandardDatasetBase, ImageConditionedMixin, ViewImageConditionedMixin, MultiViewProjImageConditionedMixin
 from ..modules.sparse import SparseTensor, sparse_cat
 from ..representations import MeshWithVoxel
 from ..renderers import PbrMeshRenderer, EnvMap
@@ -662,5 +662,16 @@ class ViewImageConditionedSLatPbrView(ViewImageConditionedMixin, SLatPbrView):
     
     Uses ViewImageConditionedMixin which reads mesh_scale from view{XX}_scale.json
     and provides camera parameters for 3D-to-2D projection.
+    """
+    pass
+
+
+class MultiViewProjSLatPbrView(MultiViewProjImageConditionedMixin, SLatPbrView):
+    """
+    Multi-view image-conditioned PBR latent dataset (Route B, texture stage).
+
+    Owns the same view-aligned PBR + shape latents as the single-view path
+    (view 0 / primary) plus V-1 auxiliary views with their relative camera
+    poses, padded to ``max_views``.
     """
     pass

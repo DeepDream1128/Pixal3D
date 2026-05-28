@@ -1,0 +1,92 @@
+{
+    "_comment": "Pixal3D Sparse Structure (32) Multi-View FINE-TUNE config (Route B). Loads from a single-view ckpt and continues with random V in [2, 6] views, primary view owns the latent.",
+    "models": {
+        "denoiser": {
+            "name": "SparseStructureFlowModel",
+            "args": {
+                "resolution": 8,
+                "in_channels": 8,
+                "out_channels": 8,
+                "model_channels": 1536,
+                "cond_channels": 1024,
+                "num_blocks": 30,
+                "num_heads": 12,
+                "mlp_ratio": 5.3334,
+                "pe_mode": "rope",
+                "share_mod": true,
+                "initialization": "scaled",
+                "qk_rms_norm": true,
+                "qk_rms_norm_cross": true,
+                "image_attn_mode": "proj"
+            }
+        }
+    },
+    "dataset": {
+        "name": "MultiViewProjSparseStructureLatentView",
+        "args": {
+            "min_aesthetic_score": 4.5,
+            "image_size": 512,
+            "num_views": 6,
+            "min_views": 2,
+            "max_views": 6,
+            "skip_aesthetic_score_datasets": ["texverse"],
+            "pretrained_ss_dec": "microsoft/TRELLIS-image-large/ckpts/ss_dec_conv3d_16l8_fp16"
+        }
+    },
+    "trainer": {
+        "name": "ImageConditionedProjFlowMatchingCFGTrainer",
+        "args": {
+            "debug": false,
+            "max_steps": 100000,
+            "batch_size_per_gpu": 4,
+            "batch_split": 1,
+            "snapshot_batch_size": 1,
+            "snapshot_num_samples": 1,
+            "num_workers": 8,
+            "optimizer": {
+                "name": "AdamW",
+                "args": {
+                    "lr": 5e-5,
+                    "weight_decay": 0.01,
+                    "betas": [0.9, 0.95],
+                    "eps": 1e-8
+                }
+            },
+            "ema_rate": [0.9999],
+            "mix_precision_mode": "amp",
+            "mix_precision_dtype": "bfloat16",
+            "grad_clip": {
+                "name": "AdaptiveGradClipper",
+                "args": {
+                    "max_norm": 1.0,
+                    "clip_percentile": 95
+                }
+            },
+            "i_print": 200,
+            "i_log": 5,
+            "i_sample": 2000,
+            "i_save": 2000,
+            "p_uncond": 0.1,
+            "t_schedule": {
+                "name": "logitNormal",
+                "args": {
+                    "mean": 1.0,
+                    "std": 1.0
+                }
+            },
+            "sigma_min": 1e-5,
+            "run_projection_test": false,
+            "image_cond_model": {
+                "name": "DinoV3ProjFeatureExtractor",
+                "args": {
+                    "model_name": "camenduru/dinov3-vitl16-pretrain-lvd1689m",
+                    "image_size": 512,
+                    "grid_resolution": 8
+                },
+                "image_attn_mode": "proj"
+            },
+            "_comment_finetune_ckpt": "Set finetune_ckpt to the released single-view SS-32 checkpoint path before training. The trainer's finetune logic will copy the matching weights and skip mismatched keys.",
+            "finetune_ckpt": null
+        }
+    }
+}

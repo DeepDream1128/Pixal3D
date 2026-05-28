@@ -289,6 +289,179 @@ class ViewImageConditionedMixin:
         return pack
 
 
+class MultiViewProjImageConditionedMixin:
+    """
+    Multi-view image-conditioned mixin for proj-mode (Pixal3D § 3.2.3 / § 3.4).
+
+    For each sample, randomly samples ``V`` views in ``[min_views, max_views]``
+    (default [2, 6], following the paper). View 0 is *always* the **primary**
+    view that owns the latent (i.e. this mixin must be combined with a
+    parent dataset whose ``get_instance`` already loaded a view-aligned latent
+    via ``self._current_view_idx`` and ``self._current_latent_dir`` — exactly
+    the same hooks used by ``ViewImageConditionedMixin``).
+
+    Output shape (always padded to ``max_views``):
+
+      pack['cond']             : [V_max, 3, H, W]   stacked images
+      pack['camera_angle_x']   : [V_max]            FOV per view
+      pack['camera_distance']  : [V_max]            translation norm in *world* frame
+      pack['mesh_scale']       : [V_max]            primary's total_scale broadcast
+      pack['transform_matrix'] : [V_max, 4, 4]      aux: T in *primary canonical frame*
+                                                    primary slot is identity-like (will be
+                                                    treated as ``None`` downstream)
+      pack['view_valid']       : [V_max]            1 = real view, 0 = padding
+      pack['num_views']        : int                actual V for this sample
+
+    Args:
+        image_size:    DINOv3 input resolution (default 518)
+        min_views:     Minimum sampled views (default 2)
+        max_views:     Maximum sampled views (default 6) — also the padding length
+    """
+    # Sentinel for "primary view, use front_view default"
+    _PRIMARY_TM_SENTINEL = 'primary'
+
+    def __init__(self, roots, *, image_size=518, min_views: int = 2, max_views: int = 6, **kwargs):
+        self.image_size = image_size
+        self.mv_min_views = int(min_views)
+        self.mv_max_views = int(max_views)
+        assert 1 <= self.mv_min_views <= self.mv_max_views, \
+            f'invalid (min_views, max_views) = ({min_views}, {max_views})'
+        super().__init__(roots, **kwargs)
+
+    def filter_metadata(self, metadata, dataset_name=None):
+        metadata, stats = super().filter_metadata(metadata, dataset_name=dataset_name)
+        metadata = metadata[metadata['cond_rendered'].notna()]
+        stats['Cond rendered'] = len(metadata)
+        return metadata, stats
+
+    @staticmethod
+    def _front_view_transform_matrix(distance: float) -> torch.Tensor:
+        """Match ProjGrid.front_view_transform_matrix for the given distance."""
+        T = torch.tensor([
+            [1.0, 0.0,  0.0,         0.0],
+            [0.0, 0.0, -1.0, -float(distance)],
+            [0.0, 1.0,  0.0,         0.0],
+            [0.0, 0.0,  0.0,         1.0],
+        ], dtype=torch.float32)
+        return T
+
+    def _load_view_image(self, image_root: str, frame_metadata: dict) -> torch.Tensor:
+        """Load and (alpha-)resize one view to [3, image_size, image_size]."""
+        image_path = os.path.join(image_root, frame_metadata['file_path'])
+        image = Image.open(image_path)
+        image = image.resize((self.image_size, self.image_size), Image.Resampling.LANCZOS)
+        alpha = image.getchannel(3)
+        image = image.convert('RGB')
+        image_t = torch.tensor(np.array(image)).permute(2, 0, 1).float() / 255.0
+        alpha_t = torch.tensor(np.array(alpha)).float() / 255.0
+        return image_t * alpha_t.unsqueeze(0)
+
+    def get_instance(self, root, instance):
+        pack = super().get_instance(root, instance)
+        if not hasattr(self, '_current_view_idx'):
+            raise RuntimeError(
+                "Parent class must set '_current_view_idx' before "
+                "calling MultiViewProjImageConditionedMixin.get_instance"
+            )
+        if not hasattr(self, '_current_latent_dir'):
+            raise RuntimeError(
+                "Parent class must set '_current_latent_dir' before "
+                "calling MultiViewProjImageConditionedMixin.get_instance"
+            )
+        primary_idx = int(self._current_view_idx)
+        latent_dir = self._current_latent_dir
+
+        image_root = os.path.join(root['render_cond'], instance)
+        with open(os.path.join(image_root, 'transforms.json')) as f:
+            tmeta = json.load(f)
+        all_frames = tmeta['frames']
+        n_views = len(all_frames)
+        if n_views < 1 or primary_idx >= n_views:
+            raise RuntimeError(
+                f'Bad view setup for {instance}: primary={primary_idx}, n_views={n_views}'
+            )
+
+        # Sample V (number of *real* views, including primary)
+        v_max_real = min(self.mv_max_views, n_views)
+        v_min_real = min(self.mv_min_views, v_max_real)
+        V = int(np.random.randint(v_min_real, v_max_real + 1))
+
+        # Pick V-1 aux view indices (≠ primary), no replacement
+        candidate_aux = [i for i in range(n_views) if i != primary_idx]
+        if V - 1 > len(candidate_aux):
+            V = len(candidate_aux) + 1
+        aux_indices = list(np.random.choice(candidate_aux, size=V - 1, replace=False)) if V > 1 else []
+        view_indices = [primary_idx] + [int(a) for a in aux_indices]
+
+        # Primary canonical reference (matches ProjGrid's default semantics)
+        primary_frame = all_frames[primary_idx]
+        primary_T_world = torch.tensor(primary_frame['transform_matrix'], dtype=torch.float32)
+        primary_distance = float(torch.linalg.norm(primary_T_world[:3, 3]).item())
+        T_canon_primary = self._front_view_transform_matrix(primary_distance)
+
+        # mesh_scale from primary's view_idx_scale.json (consistent with single-view path)
+        scale_path = os.path.join(latent_dir, f'view{primary_idx:02d}_scale.json')
+        if not os.path.exists(scale_path):
+            raise FileNotFoundError(f'Scale file not found: {scale_path}')
+        with open(scale_path) as f:
+            scale_data = json.load(f)
+        if 'total_scale' not in scale_data:
+            raise KeyError(f"'total_scale' not found in {scale_path}")
+        primary_mesh_scale = float(scale_data['total_scale'])
+
+        # ---- Build per-view tensors ------------------------------------
+        Vmax = self.mv_max_views
+        H = W = self.image_size
+        images = torch.zeros(Vmax, 3, H, W, dtype=torch.float32)
+        cam_angle = torch.zeros(Vmax, dtype=torch.float32)
+        cam_dist = torch.zeros(Vmax, dtype=torch.float32)
+        mesh_scl = torch.full((Vmax,), primary_mesh_scale, dtype=torch.float32)
+        # transform_matrix[v=0] is identity (sentinel; downstream will pass None for primary)
+        # transform_matrix[v>=1] is aux's c2w in primary's canonical frame
+        T_mv = torch.zeros(Vmax, 4, 4, dtype=torch.float32)
+        T_mv[:] = torch.eye(4)
+        T_mv[0] = T_canon_primary
+        view_valid = torch.zeros(Vmax, dtype=torch.bool)
+
+        for slot, vid in enumerate(view_indices):
+            frame = all_frames[vid]
+            images[slot] = self._load_view_image(image_root, frame)
+            # FOV: per-frame > root-level
+            if 'camera_angle_x' in frame:
+                cam_angle[slot] = float(frame['camera_angle_x'])
+            elif 'camera_angle_x' in tmeta:
+                cam_angle[slot] = float(tmeta['camera_angle_x'])
+            else:
+                raise KeyError(f"camera_angle_x missing for {instance} view {vid}")
+            T_w = torch.tensor(frame['transform_matrix'], dtype=torch.float32)
+            cam_dist[slot] = float(torch.linalg.norm(T_w[:3, 3]).item())
+            if slot == 0:
+                # primary slot: T_canon_p (treated as None downstream)
+                T_mv[slot] = T_canon_primary
+            else:
+                # aux: T_canon_p @ inv(T_world_p) @ T_world_aux
+                T_mv[slot] = T_canon_primary @ torch.linalg.inv(primary_T_world) @ T_w
+            view_valid[slot] = True
+
+        # Padded slots: copy primary image / camera (DINOv3 will still run on it,
+        # but valid mask zeros it out during aggregation).
+        for slot in range(V, Vmax):
+            images[slot] = images[0]
+            cam_angle[slot] = cam_angle[0]
+            cam_dist[slot] = cam_dist[0]
+            T_mv[slot] = T_mv[0]
+            # view_valid[slot] stays False
+
+        pack['cond'] = images
+        pack['camera_angle_x'] = cam_angle
+        pack['camera_distance'] = cam_dist
+        pack['mesh_scale'] = mesh_scl
+        pack['transform_matrix'] = T_mv
+        pack['view_valid'] = view_valid
+        pack['num_views'] = V
+        return pack
+
+
 class MultiImageConditionedMixin:
     def __init__(self, roots, *, image_size=518, max_image_cond_view = 4, **kwargs):
         self.image_size = image_size

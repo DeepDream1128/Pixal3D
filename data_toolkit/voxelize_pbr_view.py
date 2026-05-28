@@ -492,6 +492,11 @@ if __name__ == '__main__':
     if opt.instances is None:
         if opt.filter_low_aesthetic_score is not None:
             metadata = metadata[metadata['aesthetic_score'] >= opt.filter_low_aesthetic_score]
+        if 'pbr_dumped' not in metadata.columns:
+            print('[voxelize_pbr_view] WARN: column "pbr_dumped" not present in metadata.')
+            print('  Stage 2 (dump_pbr) likely produced 0 outputs. Skipping this stage gracefully.')
+            print('  -> Hint: rerun dump_pbr first, or pass --instances <sha256_list>.')
+            sys.exit(0)
         metadata = metadata[metadata['pbr_dumped'] == True]
 
         # Filter out objects with all views already processed

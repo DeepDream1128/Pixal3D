@@ -5,7 +5,7 @@ import numpy as np
 import torch
 import utils3d
 from .. import models
-from .components import ImageConditionedMixin, ViewImageConditionedMixin
+from .components import ImageConditionedMixin, ViewImageConditionedMixin, MultiViewProjImageConditionedMixin
 from ..modules.sparse import SparseTensor
 from .structured_latent import SLatVisMixin, SLat
 from ..utils.render_utils import get_renderer, yaw_pitch_r_fov_to_extrinsics_intrinsics
@@ -398,5 +398,16 @@ class ViewImageConditionedSLatShapeView(ViewImageConditionedMixin, SLatShapeView
     corresponding view from render_cond.
     
     Uses ViewImageConditionedMixin which reads mesh_scale from view{XX}_scale.json.
+    """
+    pass
+
+
+class MultiViewProjSLatShapeView(MultiViewProjImageConditionedMixin, SLatShapeView):
+    """
+    Multi-view image-conditioned shape latent dataset (Route B).
+
+    Owns the same view-aligned shape latent as the single-view path
+    (view 0 / primary) but additionally loads V-1 auxiliary views with
+    their relative camera poses, padded to ``max_views``.
     """
     pass
